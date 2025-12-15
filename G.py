@@ -1,326 +1,324 @@
-# =========================
-# ONE-CELL COLAB (FIXED):
-# - Phase-only slope (slope_phase ~ 2)
-# - Robust F* (median over window, avoids blow-ups)
-# - Fig.1 uses phase points only
-# =========================
-
+# === P6 LOGIC-CHAIN (SINGLE CELL) ===
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from scipy.stats import linregress
+import warnings
+warnings.filterwarnings("ignore")
 
+# ---------------------------
+# 0) Global config
+# ---------------------------
 CFG = dict(
-    n=64,
-    T=320,
-    seeds=5,
-    eps_list=np.logspace(-6, -1, 9),
-    dt_safety=0.9,
-    w=9,                 # half-window for robust K(t)
-    deltaK=0.05,
-    r2_min=0.85,
-    floor=1e-30,
-    ref_family="lap_like",
-    defect_density=0.02,
-    low_rank=4,
-    make_plots=True,
-    save_prefix="closure_run_fixed"
+    dt=0.001,
+    T=400,
+    kappa=1.0,
+    noise=0.1,
+    deltaK=0.1,
+    eps0=1e-3,
+    eps_scan=np.array([1e-4,3e-4,8e-4,2.2e-3,6.3e-3,1.77e-2,5e-2], float),
+    seeds=list(range(20)),
 )
 
-np.set_printoptions(precision=4, suppress=True)
+def cov(x):
+    x=np.asarray(x,float); m=float(np.mean(x)); s=float(np.std(x,ddof=1)) if len(x)>1 else 0.0
+    return np.inf if abs(m)<1e-300 else s/m
 
-def linreg_slope_r2(x, y):
-    x = np.asarray(x); y = np.asarray(y)
-    if len(x) < 3:
-        return np.nan, np.nan
-    X = np.vstack([x, np.ones_like(x)]).T
-    beta, *_ = np.linalg.lstsq(X, y, rcond=None)
-    slope = float(beta[0])
-    yhat = X @ beta
-    ss_res = float(np.sum((y - yhat)**2))
-    ss_tot = float(np.sum((y - np.mean(y))**2) + 1e-18)
-    r2 = 1.0 - ss_res/ss_tot
-    return slope, float(r2)
+# ---------------------------
+# 1) Core builders
+# ---------------------------
+def build_laplacian(N, dim=1):
+    Nn = N**dim
+    if dim==1:
+        D=np.zeros((N-1,N))
+        for i in range(N-1):
+            D[i,i]=-1.0; D[i,i+1]=1.0
+        return D.T@D, Nn
+    if dim==2:
+        L=np.zeros((Nn,Nn))
+        for i in range(Nn):
+            r,c=i//N,i%N
+            nb=[]
+            if c<N-1: nb.append(i+1)
+            if c>0:   nb.append(i-1)
+            if r<N-1: nb.append(i+N)
+            if r>0:   nb.append(i-N)
+            L[i,i]=len(nb)
+            for j in nb: L[i,j]=-1.0
+        return L, Nn
+    if dim==3:
+        L=np.zeros((Nn,Nn)); Np=N*N
+        for i in range(Nn):
+            x=i%N; y=(i//N)%N; z=i//Np
+            nb=[]
+            if x<N-1: nb.append(i+1)
+            if x>0:   nb.append(i-1)
+            if y<N-1: nb.append(i+N)
+            if y>0:   nb.append(i-N)
+            if z<N-1: nb.append(i+Np)
+            if z>0:   nb.append(i-Np)
+            L[i,i]=len(nb)
+            for j in nb: L[i,j]=-1.0
+        return L, Nn
+    raise NotImplementedError
 
-def spectral_radius(A, iters=60, seed=0):
-    rng = np.random.default_rng(seed)
-    x = rng.normal(size=(A.shape[0],))
-    x /= (np.linalg.norm(x) + 1e-18)
-    for _ in range(iters):
-        y = A @ x
-        ny = np.linalg.norm(y)
-        if ny < 1e-18:
-            return 0.0
-        x = y / ny
-    return float(np.linalg.norm(A @ x))
+def build_Delta(L, def_type, seed=0):
+    np.random.seed(seed)
+    n=L.shape[0]
+    if def_type=="Lap_Like":
+        R=np.random.randn(n,n)*0.05; R=0.5*(R+R.T)
+        D=L+R
+        return D-D.mean()
+    if def_type=="Diag_Local":
+        D=np.zeros((n,n))
+        k=max(1,int(0.1*n))
+        idx=np.random.choice(n,k,replace=False)
+        for i in idx: D[i,i]=np.random.randn()
+        return D - np.trace(D)/n*np.eye(n)
+    if def_type=="Random_Sparse":
+        R=np.random.randn(n,n); R=0.5*(R+R.T)
+        ones=np.ones((n,1))
+        return R - (R@ones)@ones.T/n
+    if def_type=="Low_Rank":
+        r=max(1,int(np.sqrt(n)//2))
+        U=np.random.randn(n,r); D=U@U.T; D=0.5*(D+D.T)
+        return D-D.mean()
+    raise ValueError("unknown def_type")
 
-def laplacian_1d_ring(n):
-    L = np.zeros((n, n), dtype=np.float64)
-    for i in range(n):
-        L[i, i] = 2.0
-        L[i, (i-1) % n] = -1.0
-        L[i, (i+1) % n] = -1.0
-    return L
+def build_B(L, eps, Delta):
+    return L + eps*Delta
 
-def make_defect(family, n, rng, density=0.02, low_rank=4):
-    if family == "lap_like":
-        D = np.zeros((n, n), dtype=np.float64)
-        for i in range(n):
-            D[i, i] = rng.normal(scale=0.5)
-            D[i, (i+1) % n] += rng.normal(scale=0.2)
-            D[i, (i-1) % n] += rng.normal(scale=0.2)
-        D = 0.5*(D + D.T)
-        np.fill_diagonal(D, 0.0)
-        return D
+# ---------------------------
+# 2) Dynamics + residual/invariants
+# ---------------------------
+def simulate_u(B, T=400, dt=0.001, kappa=1.0, noise=0.1, seed=0):
+    np.random.seed(seed)
+    n=B.shape[0]
+    u=np.random.randn(n); out=[u.copy()]
+    for _ in range(T-1):
+        eta=noise*np.sqrt(dt)*np.random.randn(n)
+        u = u + dt*(-kappa*(B@u) + eta)
+        out.append(u.copy())
+    return np.array(out)
 
-    if family == "diag_local":
-        D = np.zeros((n, n), dtype=np.float64)
-        k = max(2, n//16)
-        idx = rng.choice(n, size=k, replace=False)
-        D[idx, idx] = rng.normal(size=k)
-        return D
+def chi_ts(L,B,u_ts):
+    return ((L-B)@u_ts.T).T
 
-    if family == "random_sparse":
-        D = np.zeros((n, n), dtype=np.float64)
-        m = int(density * n * n)
-        for _ in range(m):
-            i = int(rng.integers(0, n))
-            j = int(rng.integers(0, n))
-            if i == j:
+def invariants(chi, dt):
+    H=np.sum(chi**2,axis=1)
+    Phi=np.sum(np.abs(chi),axis=1)
+    logH=np.log(H+1e-300); logP=np.log(Phi+1e-300)
+    dlogH=np.gradient(logH,dt); dlogP=np.gradient(logP,dt)
+    dlogP[np.abs(dlogP)<1e-15]=1e-15
+    K=dlogH/dlogP
+    Pdot=np.gradient(Phi,dt)
+    F=H/(Phi*np.abs(Pdot)+1e-300)
+    return H,Phi,Pdot,K,F
+
+def Ward_stat(L,B,u_ts,chi):
+    Bu=(B@u_ts.T).T
+    num=np.linalg.norm(chi,axis=1)
+    den=np.linalg.norm(Bu,axis=1)+1e-300
+    return float(np.median(num/den))
+
+def basin_mask(H,Phi,Pdot,K, Kt=2.0, deltaK=0.1):
+    return (np.abs(K-Kt)<deltaK) & (H>1e-10) & (Phi>1e-10) & (np.abs(Pdot)>1e-8)
+
+def robust_Kfit(H,Phi,mask,trim=0.2):
+    x=np.log(Phi+1e-300)[mask]
+    y=np.log(H+1e-300)[mask]
+    if len(x)<6: return np.nan
+    s1,b1,r1,_,_=linregress(x,y)
+    res=np.abs(y-(b1+s1*x))
+    k=int((1-trim)*len(res))
+    idx=np.argsort(res)[:max(4,k)]
+    s2,_,_,_,_=linregress(x[idx],y[idx])
+    return float(s2)
+
+def run_one(L, Delta, eps, seed_u):
+    B = build_B(L, eps, Delta)
+    u = simulate_u(B, T=CFG["T"], dt=CFG["dt"], seed=seed_u,
+                   kappa=CFG["kappa"], noise=CFG["noise"])
+    chi = chi_ts(L,B,u)
+    H,Phi,Pdot,K,F = invariants(chi, CFG["dt"])
+    m = basin_mask(H,Phi,Pdot,K, deltaK=CFG["deltaK"])
+    if not np.any(m): 
+        return None
+    return dict(
+        Fbar=float(np.median(F[m])),
+        Ward=Ward_stat(L,B,u,chi),
+        Kfit=robust_Kfit(H,Phi,m),
+        basin_ct=int(np.sum(m))
+    )
+
+# ---------------------------
+# 3) Spectral factor Zs = 1/effrank(Δ)
+# ---------------------------
+def eigvals_sym(A):
+    A=0.5*(A+A.T)
+    return np.linalg.eigvalsh(A)
+
+def Zs_effrank(Delta):
+    w=np.abs(eigvals_sym(Delta))
+    s=w/(np.sum(w)+1e-300)
+    H=-np.sum(s*np.log(s+1e-300))
+    r_eff=float(np.exp(H))
+    return 1.0/(r_eff+1e-300)
+
+def fit_no_intercept(Zc, Zs, F):
+    X=np.column_stack([Zc,Zs]).astype(float)
+    y=np.asarray(F,float)
+    beta, *_ = np.linalg.lstsq(X,y,rcond=None)
+    yhat=X@beta
+    R2_unc = 1.0 - float(np.sum((y-yhat)**2))/float(np.sum(y**2)+1e-300)
+    n=len(y); k=2
+    sse=float(np.sum((y-yhat)**2))
+    sst0=float(np.sum(y**2)+1e-300)
+    Adj = 1.0 - (sse/max(1,n-k))/((sst0/max(1,n))+1e-300)
+    return float(beta[0]), float(beta[1]), float(R2_unc), float(Adj)
+
+# ---------------------------
+# 4) Families
+# ---------------------------
+FAMILIES = [
+    dict(name="1D Lap_Like",      def_type="Lap_Like",      dim=1, N=32),
+    dict(name="2D Diag_Local",    def_type="Diag_Local",    dim=2, N=8),
+    dict(name="2D Random_Sparse", def_type="Random_Sparse", dim=2, N=8),
+    dict(name="3D Low_Rank",      def_type="Low_Rank",      dim=3, N=6),
+]
+
+print("=== P6 LOGIC-CHAIN SINGLE CELL ===")
+print("CFG:", CFG)
+print("Families:", [f["name"] for f in FAMILIES])
+
+# ============================================================
+# I) L0: Precision closure test (L=B => Ward ~ machine epsilon)
+# ============================================================
+L0_L,_ = build_laplacian(32,1)
+L0_B = L0_L.copy()
+u0 = simulate_u(L0_B, T=CFG["T"], dt=CFG["dt"], seed=0, kappa=CFG["kappa"], noise=CFG["noise"])
+chi0 = chi_ts(L0_L,L0_B,u0)
+W0 = Ward_stat(L0_L,L0_B,u0,chi0)
+print("\n--- I) L0 PRECISION CLOSURE ---")
+print(f"Ward_rel (L=B) = {W0:.3e} | max||chi|| = {np.max(np.linalg.norm(chi0,axis=1)):.3e}")
+
+# ============================================================
+# II) K=2 universality: pooled across families/eps/seeds
+# ============================================================
+rows=[]
+for fam in FAMILIES:
+    L,_=build_laplacian(fam["N"], fam["dim"])
+    for s in CFG["seeds"]:
+        Delta = build_Delta(L, fam["def_type"], seed=s)
+        for eps in CFG["eps_scan"]:
+            r = run_one(L, Delta, eps, seed_u=s)
+            if r is None: 
                 continue
-            v = rng.normal()
-            D[i, j] += v
-            D[j, i] += v
-        np.fill_diagonal(D, 0.0)
-        return D
+            rows.append(dict(family=fam["name"], def_type=fam["def_type"], dim=fam["dim"],
+                             N_nodes=L.shape[0], seed=s, eps=eps, **r))
 
-    if family == "low_rank":
-        r = int(low_rank)
-        U = rng.normal(size=(n, r))
-        D = U @ U.T
-        D = D - np.diag(np.diag(D))
-        D = 0.5*(D + D.T)
-        D /= (np.linalg.norm(D, ord='fro') + 1e-18)
-        return D
+df = pd.DataFrame(rows)
+k = df["Kfit"].dropna().to_numpy()
 
-    raise ValueError(f"Unknown family: {family}")
+print("\n--- II) K=2 KINEMATIC UNIVERSALITY (pooled) ---")
+print("K_fit pooled mean =", float(np.mean(k)))
+print("K_fit pooled std  =", float(np.std(k, ddof=1)))
+print("K_fit pooled min/max =", float(np.min(k)), "/", float(np.max(k)))
 
-def evolve(u0, B, T, dt):
-    u = u0.copy()
-    traj = np.zeros((T, len(u0)), dtype=np.float64)
-    for t in range(T):
-        traj[t] = u
-        u = u - dt * (B @ u)
-    return traj
+# ============================================================
+# III) d -> 4 interface (plug your DAG estimator here)
+# ============================================================
+def estimate_alexandrov_dimension(M=1000, seed=0):
+    # TODO: replace with your real estimator
+    return dict(d_mean=np.nan, ci_low=np.nan, ci_high=np.nan)
 
-def observables(L, B, traj):
-    chi = ((L - B) @ traj.T).T
-    H = np.sum(chi**2, axis=1)
-    Phi = np.sum(np.abs(chi), axis=1)
-    Bu = (B @ traj.T).T
-    num = np.linalg.norm(chi, axis=1) + 1e-30
-    den = np.linalg.norm(Bu, axis=1) + 1e-30
-    Ward_series = num / den
-    return chi, H, Phi, Ward_series
+def microcausality_metrics(M=1000, seed=0):
+    # TODO: replace with your real metrics
+    return dict(strict_leak=np.nan, c_eff=np.nan)
 
-def robust_K(H, Phi, w, floor=1e-30):
-    T = len(H)
-    K = np.full(T, np.nan, dtype=np.float64)
-    R2 = np.full(T, np.nan, dtype=np.float64)
-    logH = np.log(np.maximum(H, floor))
-    logP = np.log(np.maximum(Phi, floor))
-    for t in range(w, T-w):
-        xs = logP[t-w:t+w+1]
-        ys = logH[t-w:t+w+1]
-        slope, r2 = linreg_slope_r2(xs, ys)
-        K[t] = slope
-        R2[t] = r2
-    return K, R2
+print("\n--- III) d -> 4 GEOMETRY FLOW (INTERFACE) ---")
+for M in [1000, 1800]:
+    dres = estimate_alexandrov_dimension(M=M, seed=0)
+    cres = microcausality_metrics(M=M, seed=0)
+    print(f"M={M} | d={dres['d_mean']} (CI [{dres['ci_low']},{dres['ci_high']}]) | leak={cres['strict_leak']} | c_eff={cres['c_eff']}")
 
-def find_t_star(K, R2, deltaK, r2_min):
-    idx = np.where(np.isfinite(K) & np.isfinite(R2) & (np.abs(K-2.0) < deltaK) & (R2 > r2_min))[0]
-    return int(idx[0]) if len(idx) else None
+# ============================================================
+# IV) Topological locking at eps0 (per-family OLS, Zs=effrank)
+# ============================================================
+amp_rows=[]
+for fam in FAMILIES:
+    L,_=build_laplacian(fam["N"], fam["dim"])
+    Zc_list=[]; Zs_list=[]; F_list=[]
+    for s in CFG["seeds"]:
+        Delta=build_Delta(L,fam["def_type"],seed=s)
+        r = run_one(L, Delta, CFG["eps0"], seed_u=s)
+        if r is None: 
+            continue
+        Fbar, W = r["Fbar"], r["Ward"]
+        Zc_list.append(1.0/(W+1e-300))
+        Zs_list.append(Zs_effrank(Delta))
+        F_list.append(Fbar)
+    Zc_arr=np.array(Zc_list); Zs_arr=np.array(Zs_list); F_arr=np.array(F_list)
+    if len(F_arr) < 6:
+        amp_rows.append(dict(family=fam["name"], AdjR2=np.nan, R2_unc=np.nan, C2=np.nan, C3=np.nan, n=len(F_arr)))
+        continue
+    C2,C3,R2u,Adj=fit_no_intercept(Zc_arr,Zs_arr,F_arr)
+    amp_rows.append(dict(family=fam["name"], AdjR2=Adj, R2_unc=R2u, C2=C2, C3=C3, n=len(F_arr)))
 
-def phase_mask(K, R2, deltaK, r2_min):
-    return np.isfinite(K) & np.isfinite(R2) & (np.abs(K-2.0) < deltaK) & (R2 > r2_min)
+amp_df=pd.DataFrame(amp_rows).sort_values("AdjR2", ascending=False)
+print("\n--- IV) TOPOLOGICAL LOCKING @ eps0 (per-family OLS, Zs=effrank) ---")
+print(amp_df.to_string(index=False))
 
-def robust_F_star(H, Phi, dt, t_star, wF=7):
-    # Robust: median over a small window around t*; avoid tiny dPhi blow-ups.
-    if t_star is None:
-        return np.nan
-    T = len(H)
-    a = max(1, t_star - wF)
-    b = min(T-2, t_star + wF)
-    vals = []
-    for t in range(a, b+1):
-        # centered dPhi
-        dPhi = (Phi[t+1] - Phi[t-1]) / (2.0*dt)
-        denom = Phi[t] * (abs(dPhi) + 1e-30)
-        vals.append(H[t] / (denom + 1e-30))
-    return float(np.median(vals)) if len(vals) else np.nan
+# ============================================================
+# V) Order-parameter stability: alpha_raw ~ 0 across eps (median over seeds)
+# ============================================================
+dyn_rows=[]
+for fam in FAMILIES:
+    sub = df[df["family"]==fam["name"]].copy()
+    g = sub.groupby("eps").agg(Fbar=("Fbar","median"), Ward=("Ward","median")).reset_index()
+    if len(g) < 3: 
+        continue
+    g0 = g.iloc[(np.abs(g["eps"].to_numpy()-CFG["eps0"])).argmin()]
+    F0=float(g0["Fbar"]); W0=float(g0["Ward"])
+    x=np.log(g["Ward"].to_numpy()/(W0+1e-300)+1e-300)
+    y=np.log(g["Fbar"].to_numpy()/(F0+1e-300)+1e-300)
+    s1,b1,r1,_,_=linregress(x,y)
+    alpha=float(-s1); R2=float(r1**2)
+    dyn_rows.append(dict(family=fam["name"], alpha_raw=alpha, R2_raw=R2, CoV_F=cov(g["Fbar"].to_numpy())))
 
-def run_family(family, cfg, L, rho_ref):
-    rows = []
-    fig_payload = []  # representative plots at mid eps
+dyn_df=pd.DataFrame(dyn_rows)
+print("\n--- V) ORDER PARAMETER STABILITY (alpha ~ 0, CoV small) ---")
+print(dyn_df.to_string(index=False))
 
-    for eps in cfg["eps_list"]:
-        Ward_meds, K_atstar, Fstars = [], [], []
-        slope_all_list, slope_all_r2_list = [], []
-        slope_ph_list, slope_ph_r2_list = [], []
-        rho_list = []
-        phase_counts = []
-        valid_tstar = 0
+# ============================================================
+# VI) One-panel summary plots
+# ============================================================
+fig = plt.figure(figsize=(10,6))
 
-        for s in range(cfg["seeds"]):
-            rng = np.random.default_rng(10_000 + s)
-            Delta = make_defect(family, cfg["n"], rng, density=cfg["defect_density"], low_rank=cfg["low_rank"])
-            rhoD = spectral_radius(Delta, seed=100+s)
-            rho_list.append(rhoD)
+plt.subplot(2,2,1)
+plt.hist(df["Kfit"].dropna().to_numpy(), bins=30)
+plt.title("K_fit pooled distribution")
+plt.xlabel("K_fit"); plt.ylabel("count")
 
-            B = L + eps * Delta
-            rhoB = spectral_radius(B, seed=200+s)
-            dt = cfg["dt_safety"] / (rhoB + 1e-12)
+plt.subplot(2,2,2)
+plt.bar(dyn_df["family"], dyn_df["alpha_raw"])
+plt.xticks(rotation=30, ha="right")
+plt.title("alpha_raw (logF vs logWard slope)")
+plt.ylabel("alpha_raw")
 
-            u0 = rng.normal(size=(cfg["n"],))
-            traj = evolve(u0, B, cfg["T"], dt)
-            chi, H, Phi, Ward_series = observables(L, B, traj)
+plt.subplot(2,2,3)
+plt.bar(dyn_df["family"], dyn_df["CoV_F"])
+plt.xticks(rotation=30, ha="right")
+plt.title("CoV(Fbar) across eps")
+plt.ylabel("CoV")
 
-            K, KR2 = robust_K(H, Phi, cfg["w"], floor=cfg["floor"])
-            t_star = find_t_star(K, KR2, cfg["deltaK"], cfg["r2_min"])
-            if t_star is not None:
-                valid_tstar += 1
+plt.subplot(2,2,4)
+plt.bar(amp_df["family"], amp_df["AdjR2"])
+plt.xticks(rotation=30, ha="right")
+plt.title("Topological locking strength (Adj.R2) @ eps0")
+plt.ylim(0,1.05)
 
-            # ---- slope_all (old) ----
-            idx = np.arange(cfg["w"], cfg["T"]-cfg["w"])
-            slope_all, r2_all = linreg_slope_r2(np.log(np.maximum(Phi[idx], cfg["floor"])),
-                                                np.log(np.maximum(H[idx], cfg["floor"])))
-            slope_all_list.append(slope_all); slope_all_r2_list.append(r2_all)
+plt.tight_layout()
 
-            # ---- slope_phase (FIX) ----
-            m = phase_mask(K, KR2, cfg["deltaK"], cfg["r2_min"])
-            phase_counts.append(int(np.sum(m)))
-            if np.sum(m) >= 6:
-                slope_ph, r2_ph = linreg_slope_r2(np.log(np.maximum(Phi[m], cfg["floor"])),
-                                                  np.log(np.maximum(H[m], cfg["floor"])))
-            else:
-                slope_ph, r2_ph = (np.nan, np.nan)
-            slope_ph_list.append(slope_ph); slope_ph_r2_list.append(r2_ph)
+print("\n✅ DONE (print end marker)")
 
-            # ---- K and robust F* at t* ----
-            if t_star is not None:
-                K_atstar.append(float(K[t_star]))
-                Fstars.append(robust_F_star(H, Phi, dt, t_star, wF=7))
-
-            Ward_meds.append(float(np.median(Ward_series)))
-
-            # Representative plot payload at mid eps for first seed
-            if cfg["make_plots"] and s == 0 and eps == cfg["eps_list"][len(cfg["eps_list"])//2]:
-                fig_payload.append((family, eps, H, Phi, K, KR2, m, t_star))
-
-        rho_mean = float(np.mean(rho_list))
-        Z = float(rho_ref / (rho_mean + 1e-18))
-
-        rows.append(dict(
-            family=family, eps=eps,
-            Ward=float(np.median(Ward_meds)),
-            rhoDelta=rho_mean,
-            ZDelta=Z,
-            K_atstar_mean=float(np.mean(K_atstar)) if len(K_atstar) else np.nan,
-            K_atstar_std=float(np.std(K_atstar)) if len(K_atstar) else np.nan,
-            F_star_robust=float(np.mean(Fstars)) if len(Fstars) else np.nan,
-            slope_all=float(np.mean(slope_all_list)),
-            slope_all_r2=float(np.mean(slope_all_r2_list)),
-            slope_phase=float(np.nanmean(slope_ph_list)),
-            slope_phase_r2=float(np.nanmean(slope_ph_r2_list)),
-            phase_pts=float(np.mean(phase_counts)),
-            valid_tstar=valid_tstar
-        ))
-
-    return pd.DataFrame(rows), fig_payload
-
-# -------------------------
-# Main
-# -------------------------
-families = ["lap_like", "diag_local", "random_sparse", "low_rank"]
-L = laplacian_1d_ring(CFG["n"])
-
-# reference rho for ZΔ
-rng0 = np.random.default_rng(123)
-Delta_ref = make_defect(CFG["ref_family"], CFG["n"], rng0, density=CFG["defect_density"], low_rank=CFG["low_rank"])
-rho_ref = spectral_radius(Delta_ref, seed=999)
-
-dfs = []
-fig_payloads = []
-for fam in families:
-    df, payload = run_family(fam, CFG, L, rho_ref)
-    dfs.append(df)
-    fig_payloads.extend(payload)
-
-res = pd.concat(dfs, ignore_index=True)
-
-# -------------------------
-# L0 closure test
-# -------------------------
-print("\n--- L0 CLOSURE TEST: log(Ward) ~ a log(eps) + b ---")
-for fam in families:
-    sub = res[res["family"] == fam].copy()
-    x = np.log(sub["eps"].values)
-    y = np.log(np.maximum(sub["Ward"].values, 1e-300))
-    a, r2 = linreg_slope_r2(x, y)
-    print(f"{fam:12s} | a={a: .3f} | R2={r2: .4f} | Ward_min={sub['Ward'].min():.3e} | Ward_max={sub['Ward'].max():.3e}")
-
-# -------------------------
-# Snapshot at mid eps
-# -------------------------
-mid_eps = CFG["eps_list"][len(CFG["eps_list"])//2]
-summ = res[res["eps"] == mid_eps].copy()
-print("\n--- UNIVERSALITY SNAPSHOT @ eps =", mid_eps, "---")
-cols = ["family","eps","Ward","K_atstar_mean","K_atstar_std",
-        "slope_all","slope_all_r2","slope_phase","slope_phase_r2",
-        "phase_pts","F_star_robust","rhoDelta","ZDelta","valid_tstar"]
-print(summ[cols].to_string(index=False))
-
-# -------------------------
-# Plots: Fig1 uses PHASE points only
-# -------------------------
-if CFG["make_plots"] and len(fig_payloads):
-    # Fig.1: phase-only scatter at mid eps, one seed per family
-    plt.figure()
-    for (fam, eps, H, Phi, K, KR2, m, t_star) in fig_payloads:
-        x = np.log(np.maximum(Phi[m], CFG["floor"]))
-        y = np.log(np.maximum(H[m], CFG["floor"]))
-        plt.scatter(x, y, s=10, alpha=0.75, label=f"{fam} (phase)")
-    plt.xlabel(r"$\log \Phi$")
-    plt.ylabel(r"$\log H$")
-    plt.title("Fig.1 (phase-only): collapse slope near 2")
-    plt.legend(fontsize=8)
-    plt.tight_layout()
-    fig1_path = f"{CFG['save_prefix']}_fig1_phase_only.png"
-    plt.savefig(fig1_path, dpi=200)
-    plt.show()
-    print("Saved:", fig1_path)
-
-    # K(t) representative: show also mask quality
-    fam, eps, H, Phi, K, KR2, m, t_star = fig_payloads[0]
-    plt.figure()
-    plt.plot(K, linewidth=1.2, label="K(t)")
-    plt.plot(np.where(m, 2.0, np.nan), linewidth=2.0, label="phase mask", alpha=0.9)
-    if t_star is not None:
-        plt.axvline(t_star, linestyle="--")
-    plt.ylim(0, 4)
-    plt.xlabel("t")
-    plt.ylabel("K(t)")
-    plt.title(f"K(t) & phase mask | family={fam}, eps={eps}")
-    plt.legend(fontsize=8)
-    plt.tight_layout()
-    figk_path = f"{CFG['save_prefix']}_K_series.png"
-    plt.savefig(figk_path, dpi=200)
-    plt.show()
-    print("Saved:", figk_path)
-
-# -------------------------
-# Export
-# -------------------------
-csv_path = f"{CFG['save_prefix']}_summary.csv"
-res.to_csv(csv_path, index=False)
-print("\nSaved:", csv_path)
-print("\n✅ ONE-CELL COLAB (FIXED) RUN COMPLETE.")
