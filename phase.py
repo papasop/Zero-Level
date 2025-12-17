@@ -1,665 +1,694 @@
 import numpy as np
 import matplotlib.pyplot as plt
-from scipy.optimize import curve_fit
 from scipy import stats
 import warnings
-warnings.filterwarnings('ignore')
+warnings.filterwarnings("ignore")
 
-class GARV6Advanced:
-    """
-    GAR-V6 导弹制导方程 - 高级研究版
-    包含理论验证、误差修正、预测扩展等高级功能
-    """
-    
-    def __init__(self):
-        # 核心参数
-        self.params = {
-            'S': 1.035,
-            'beta': -1.500,
-            'A2': 0.800,
-            'omega': 1.618,
-            'phi': np.pi/2  # 相位常数
-        }
-        
-        # 理论参数 (来自数论)
-        self.theoretical_params = {
-            'gamma': 0.5772156649,  # 欧拉常数
-            'ln2pi': np.log(2*np.pi),
-            'e': np.e
-        }
-        
-        # 缓存系统
-        self.cache = {}
-        self.error_correction_model = None
-        
-    def tau_star(self, k, correction=True):
-        """
-        GAR-V6 核心公式
-        
-        参数:
-            k: 正整数或数组
-            correction: 是否应用误差修正
-        """
-        if isinstance(k, (int, float)):
-            k = np.array([k])
-            scalar_input = True
-        else:
-            scalar_input = False
-            
-        k = np.asarray(k, dtype=np.float64)
-        
-        # 核心计算
-        S = self.params['S']
-        beta = self.params['beta']
-        A2 = self.params['A2']
-        omega = self.params['omega']
-        phi = self.params['phi']
-        
-        # Law III: 全局能量映射
-        denominator = np.log(k / (2 * np.pi * np.e))
-        # 避免小k时的数值问题
-        denominator = np.where(denominator > 0.1, denominator, np.log(k + 1e-10) - self.theoretical_params['ln2pi'] - 1)
-        
-        term1 = (2 * np.pi * k) / denominator
-        
-        # Law IV: 双曲引力场
-        term2 = beta * np.log(np.log(np.where(k > np.e, k, np.e)))
-        
-        # Law II + V: 黄金频率振荡
-        term3 = A2 * np.sin(omega * k)
-        
-        # Law VI: 几何转型
-        term4 = phi
-        
-        result = S * (term1 + term2 + term3 + term4)
-        
-        # 误差修正
-        if correction and self.error_correction_model is not None:
-            result = self._apply_correction(result, k)
-        
-        return result[0] if scalar_input else result
-    
-    def _apply_correction(self, values, k):
-        """应用误差修正模型"""
-        # 简单的对数修正模型
-        correction = 0.01 * np.log(k) - 0.02 * np.log(np.log(k + 1))
-        return values * (1 + correction/100)
-    
-    def fit_error_model(self, k_true, gamma_true):
-        """
-        拟合误差修正模型
-        
-        参数:
-            k_true: 已知的k值数组
-            gamma_true: 对应的真实γ值
-        """
-        predictions = self.tau_star(k_true, correction=False)
-        errors = (predictions - gamma_true) / gamma_true
-        
-        # 拟合误差函数: error = a*ln(k) + b*ln(ln(k)) + c
-        def error_func(k, a, b, c):
-            return a * np.log(k) + b * np.log(np.log(k + 1)) + c
-        
-        try:
-            popt, _ = curve_fit(error_func, k_true, errors, 
-                               p0=[0.01, -0.02, 0.001],
-                               bounds=([-0.1, -0.1, -0.1], [0.1, 0.1, 0.1]))
-            self.error_correction_model = popt
-            print(f"误差模型拟合成功: a={popt[0]:.6f}, b={popt[1]:.6f}, c={popt[2]:.6f}")
-        except:
-            print("误差模型拟合失败，使用默认修正")
-            self.error_correction_model = None
-    
-    def predict_zeros(self, n_zeros=100, start_k=1000):
-        """
-        批量预测零点
-        
-        参数:
-            n_zeros: 预测的零点数量
-            start_k: 起始k值
-        """
-        k_values = np.arange(start_k, start_k + n_zeros)
-        predictions = self.tau_star(k_values)
-        
-        # 计算间隔
-        intervals = np.diff(predictions)
-        
-        return {
-            'k': k_values,
-            'predictions': predictions,
-            'intervals': intervals,
-            'mean_interval': np.mean(intervals),
-            'std_interval': np.std(intervals)
-        }
-    
-    def theoretical_limits(self):
-        """理论极限分析"""
-        # 当 k → ∞ 时的渐近行为
-        asymptotic = {
-            'main_term': lambda k: 2*np.pi*k / np.log(k),
-            'relative_error_bound': 1/np.log(k)  # 相对误差上界
-        }
-        return asymptotic
-    
-    def validate_theoretical_properties(self, k_values):
-        """
-        验证理论性质
-        
-        1. 零点间隔分布
-        2. 相对误差衰减
-        3. 振荡项幅度衰减
-        """
-        predictions = self.tau_star(k_values)
-        
-        # 1. 计算间隔
-        intervals = np.diff(predictions)
-        
-        # 2. 理论间隔 (来自素数定理)
-        theoretical_intervals = 2*np.pi / np.log(k_values[1:])
-        
-        # 3. 统计分析
-        interval_stats = {
-            'mean': np.mean(intervals),
-            'std': np.std(intervals),
-            'min': np.min(intervals),
-            'max': np.max(intervals),
-            'cv': np.std(intervals) / np.mean(intervals)  # 变异系数
-        }
-        
-        # 4. 间隔比 (检验随机矩阵理论预测)
-        interval_ratios = intervals[:-1] / intervals[1:]
-        
-        return {
-            'intervals': intervals,
-            'theoretical_intervals': theoretical_intervals,
-            'interval_stats': interval_stats,
-            'interval_ratios': interval_ratios,
-            'predicted_gaps': predictions
-        }
-    
-    def monte_carlo_analysis(self, k_range=(1000, 100000), n_samples=1000):
-        """
-        蒙特卡洛分析
-        
-        参数:
-            k_range: k值范围
-            n_samples: 采样数量
-        """
-        # 随机采样k值
-        k_samples = np.random.uniform(k_range[0], k_range[1], n_samples)
-        
-        # 计算预测值
-        predictions = self.tau_star(k_samples)
-        
-        # 统计分析
-        stats_results = {
-            'mean': np.mean(predictions),
-            'std': np.std(predictions),
-            'skewness': stats.skew(predictions),
-            'kurtosis': stats.kurtosis(predictions),
-            'percentiles': np.percentile(predictions, [1, 5, 25, 50, 75, 95, 99])
-        }
-        
-        return stats_results
-    
-    def compare_with_theory(self, k_values):
-        """
-        与理论公式对比
-        
-        对比对象:
-        1. 简单近似: 2πk/ln(k)
-        2. 改进近似: 2πk/(ln(k) - 1)
-        3. Riemann-von Mangoldt公式
-        """
-        # 不同理论公式
-        theories = {
-            'simple': lambda k: 2*np.pi*k / np.log(k),
-            'improved': lambda k: 2*np.pi*k / (np.log(k) - 1),
-            'Riemann_von_Mangoldt': lambda k: (
-                2*np.pi*k / (np.log(k) - 1 - (np.log(np.log(k)) - 1)/np.log(k))
-            ),
-            'GAR_V6': lambda k: self.tau_star(k)
-        }
-        
-        comparisons = {}
-        for name, func in theories.items():
-            predictions = func(k_values)
-            # 计算统计量
-            comparisons[name] = {
-                'predictions': predictions,
-                'log_gradient': np.gradient(np.log(predictions)),  # 对数梯度
-                'relative_growth': np.gradient(predictions) / predictions  # 相对增长率
-            }
-        
-        return comparisons
-    
-    def generate_physical_interpretation(self):
-        """生成物理意义解释"""
-        interpretation = {
-            'main_term': {
-                'description': '全局能量映射标度项',
-                'physics': '描述算术宇宙在双曲几何下的标度不变性',
-                'relation': '对应黎曼ζ函数零点计数函数N(T)的反函数',
-                'units': '无量纲能量标度'
-            },
-            'log_term': {
-                'description': '双曲引力场修正项',
-                'physics': '体现ε下沉效应，修正短程关联',
-                'relation': '来自素数分布的对数积分修正',
-                'units': '引力势能修正'
-            },
-            'osc_term': {
-                'description': '黄金频率相干振荡',
-                'physics': '体现最小作用量原理下的驻波形成',
-                'relation': '对应随机矩阵理论中的特征值排斥',
-                'units': '相位相干振荡'
-            },
-            'const_term': {
-                'description': '几何转型自旋启动',
-                'physics': '提供初始相位，确保幺正性',
-                'relation': '来自解析延拓的相位项',
-                'units': '初始相位角'
-            }
-        }
-        
-        return interpretation
-    
-    def plot_advanced_analysis(self, k_values=None):
-        """高级分析图表"""
-        if k_values is None:
-            k_values = np.logspace(3, 7, 1000)  # 10^3 到 10^7
-        
-        fig = plt.figure(figsize=(18, 12))
-        
-        # 1. 主要预测与理论对比
-        ax1 = plt.subplot(3, 4, 1)
-        comparisons = self.compare_with_theory(k_values)
-        
-        for name, data in comparisons.items():
-            if name != 'GAR_V6':
-                ax1.loglog(k_values, data['predictions'], '--', alpha=0.5, label=name)
-        
-        ax1.loglog(k_values, comparisons['GAR_V6']['predictions'], 'k-', linewidth=2, label='GAR-V6')
-        ax1.set_xlabel('k')
-        ax1.set_ylabel('γ_k')
-        ax1.set_title('不同理论公式对比')
-        ax1.legend()
-        ax1.grid(True, alpha=0.3)
-        
-        # 2. 相对增长率
-        ax2 = plt.subplot(3, 4, 2)
-        for name, data in comparisons.items():
-            ax2.loglog(k_values[1:], data['relative_growth'][1:], label=name)
-        ax2.set_xlabel('k')
-        ax2.set_ylabel('相对增长率')
-        ax2.set_title('增长率分析')
-        ax2.legend()
-        ax2.grid(True, alpha=0.3)
-        
-        # 3. 零点间隔分布
-        ax3 = plt.subplot(3, 4, 3)
-        validation = self.validate_theoretical_properties(k_values[:100])
-        intervals = validation['intervals']
-        
-        ax3.hist(intervals, bins=30, alpha=0.7, density=True)
-        ax3.axvline(np.mean(intervals), color='r', linestyle='--', label=f'均值: {np.mean(intervals):.3f}')
-        ax3.set_xlabel('零点间隔')
-        ax3.set_ylabel('概率密度')
-        ax3.set_title('零点间隔分布')
-        ax3.legend()
-        ax3.grid(True, alpha=0.3)
-        
-        # 4. 间隔比分布 (GUE预测应为Wigner surmise)
-        ax4 = plt.subplot(3, 4, 4)
-        interval_ratios = validation['interval_ratios']
-        
-        ax4.hist(interval_ratios, bins=30, alpha=0.7, density=True)
-        # Wigner surmise: p(s) = (32/π²)s² exp(-4s²/π)
-        s = np.linspace(0, 3, 100)
-        wigner = (32/(np.pi**2)) * s**2 * np.exp(-4*s**2/np.pi)
-        ax4.plot(s, wigner, 'r-', label='Wigner surmise')
-        ax4.set_xlabel('间隔比 s')
-        ax4.set_ylabel('概率密度')
-        ax4.set_title('间隔比分布 (GUE检验)')
-        ax4.legend()
-        ax4.grid(True, alpha=0.3)
-        
-        # 5. 各项贡献分解
-        ax5 = plt.subplot(3, 4, 5)
-        k_sample = np.linspace(1000, 10000, 1000)
-        
-        S = self.params['S']
-        beta = self.params['beta']
-        A2 = self.params['A2']
-        omega = self.params['omega']
-        phi = self.params['phi']
-        
-        main = (2 * np.pi * k_sample) / np.log(k_sample / (2 * np.pi * np.e))
-        log = beta * np.log(np.log(k_sample))
-        osc = A2 * np.sin(omega * k_sample)
-        
-        ax5.plot(k_sample, main, 'b-', label='主项', alpha=0.7)
-        ax5.plot(k_sample, log, 'g-', label='对数修正', alpha=0.7)
-        ax5.plot(k_sample, osc, 'r-', label='振荡项', alpha=0.7)
-        ax5.plot(k_sample, phi*np.ones_like(k_sample), 'y-', label='常数项', alpha=0.7)
-        ax5.plot(k_sample, S*(main + log + osc + phi), 'k-', label='总和', linewidth=2)
-        
-        ax5.set_xlabel('k')
-        ax5.set_ylabel('各项贡献')
-        ax5.set_title('公式各项分解')
-        ax5.legend()
-        ax5.grid(True, alpha=0.3)
-        
-        # 6. 参数敏感性
-        ax6 = plt.subplot(3, 4, 6)
-        params = ['S', 'beta', 'A2', 'omega']
-        sensitivities = []
-        
-        base_pred = self.tau_star(10000)
-        
-        for param in params:
-            original = self.params[param]
-            
-            # +5% 变化
-            self.params[param] = original * 1.05
-            pred_plus = self.tau_star(10000)
-            
-            # -5% 变化
-            self.params[param] = original * 0.95
-            pred_minus = self.tau_star(10000)
-            
-            # 恢复
-            self.params[param] = original
-            
-            sensitivity = max(abs(pred_plus - base_pred), abs(pred_minus - base_pred)) / base_pred * 100
-            sensitivities.append(sensitivity)
-        
-        bars = ax6.bar(range(len(params)), sensitivities, 
-                      color=['red', 'blue', 'green', 'orange'])
-        ax6.set_xticks(range(len(params)))
-        ax6.set_xticklabels(params)
-        ax6.set_ylabel('输出变化 (%)')
-        ax6.set_title('参数敏感性 (±5%)')
-        ax6.grid(True, alpha=0.3, axis='y')
-        
-        for bar, val in zip(bars, sensitivities):
-            height = bar.get_height()
-            ax6.text(bar.get_x() + bar.get_width()/2., height + 0.1,
-                    f'{val:.2f}%', ha='center', va='bottom')
-        
-        # 7. 误差分析
-        ax7 = plt.subplot(3, 4, 7)
-        
-        # 使用已知数据点
-        known_data = {
-            1000: 1419.422481,
-            10000: 9877.782654,
-            100000: 74920.827498,
-            1000000: 600269.677012
-        }
-        
-        k_known = list(known_data.keys())
-        true_vals = list(known_data.values())
-        pred_vals = self.tau_star(k_known)
-        errors = (pred_vals - true_vals) / true_vals * 100
-        
-        ax7.semilogx(k_known, errors, 'bo-', markersize=8, linewidth=2)
-        ax7.axhline(y=0, color='k', linestyle='-', alpha=0.3)
-        ax7.axhline(y=1, color='g', linestyle='--', alpha=0.5, label='1%线')
-        ax7.axhline(y=-1, color='g', linestyle='--', alpha=0.5)
-        
-        # 拟合误差趋势
-        if len(k_known) > 2:
-            coeff = np.polyfit(np.log(k_known), errors, 1)
-            trend = np.polyval(coeff, np.log(k_values))
-            ax7.loglog(k_values, trend, 'r--', label=f'趋势: {coeff[0]:.3f}ln(k)+{coeff[1]:.3f}')
-        
-        ax7.set_xlabel('k')
-        ax7.set_ylabel('相对误差 (%)')
-        ax7.set_title('误差分析')
-        ax7.legend()
-        ax7.grid(True, alpha=0.3)
-        
-        # 8. 蒙特卡洛分析
-        ax8 = plt.subplot(3, 4, 8)
-        mc_results = self.monte_carlo_analysis()
-        
-        percentiles = mc_results['percentiles']
-        labels = ['1%', '5%', '25%', '50%', '75%', '95%', '99%']
-        
-        ax8.bar(labels, percentiles, alpha=0.7)
-        ax8.set_xlabel('百分位')
-        ax8.set_ylabel('预测值')
-        ax8.set_title('蒙特卡洛分析 - 分布百分位')
-        ax8.grid(True, alpha=0.3, axis='y')
-        
-        # 9. 理论极限
-        ax9 = plt.subplot(3, 4, 9)
-        asymptotic = self.theoretical_limits()
-        
-        k_asym = np.logspace(3, 10, 1000)
-        main_asym = asymptotic['main_term'](k_asym)
-        gar_v6 = self.tau_star(k_asym)
-        ratio = gar_v6 / main_asym
-        
-        ax9.loglog(k_asym, ratio, 'b-', linewidth=2)
-        ax9.axhline(y=1, color='r', linestyle='--', label='极限值=1')
-        ax9.set_xlabel('k')
-        ax9.set_ylabel('GAR-V6 / 理论极限')
-        ax9.set_title('渐近行为分析')
-        ax9.legend()
-        ax9.grid(True, alpha=0.3)
-        
-        # 10. 物理意义图
-        ax10 = plt.subplot(3, 4, 10)
-        ax10.axis('off')
-        
-        physics_text = (
-            "🏆 GAR-V6 物理意义\n"
-            "====================\n"
-            "• 主项: 全局能量映射\n"
-            "  双曲几何标度不变性\n\n"
-            "• 对数项: 引力场修正\n"
-            "  ε下沉效应，短程关联\n\n"
-            "• 振荡项: 黄金频率\n"
-            "  最小作用量驻波\n\n"
-            "• 常数项: 几何转型\n"
-            "  自旋启动相位\n"
-        )
-        
-        ax10.text(0.1, 0.5, physics_text, transform=ax10.transAxes,
-                 fontsize=9, verticalalignment='center',
-                 bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.5))
-        
-        # 11. 性能摘要
-        ax11 = plt.subplot(3, 4, 11)
-        ax11.axis('off')
-        
-        summary_text = (
-            "📊 性能摘要\n"
-            "===========\n"
-            f"参数:\n"
-            f"S={self.params['S']}\n"
-            f"β={self.params['beta']}\n"
-            f"A₂={self.params['A2']}\n"
-            f"ω={self.params['omega']}\n\n"
-            f"关键性能:\n"
-            f"k=10³: {errors[0]:.2f}%\n"
-            f"k=10⁴: {errors[1]:.2f}%\n"
-            f"k=10⁵: {errors[2]:.2f}%\n"
-            f"k=10⁶: {errors[3]:.2f}%\n"
-        )
-        
-        ax11.text(0.1, 0.5, summary_text, transform=ax11.transAxes,
-                 fontsize=9, verticalalignment='center',
-                 bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.5))
-        
-        # 12. 公式展示
-        ax12 = plt.subplot(3, 4, 12)
-        ax12.axis('off')
-        
-        formula_text = (
-            r"$\tau^*(k) = S \cdot \left[ \frac{2\pi k}{\ln(\frac{k}{2\pi e})} "
-            r"+ \beta \ln(\ln k) + A_2 \sin(\omega \cdot k) + \frac{\pi}{2} \right]$"
-            r"\n\n"
-            r"$\text{其中:}$"
-            r"\n"
-            r"$S = 1.035, \quad \beta = -1.500$"
-            r"\n"
-            r"$A_2 = 0.800, \quad \omega = 1.618$"
-        )
-        
-        ax12.text(0.1, 0.5, formula_text, transform=ax12.transAxes,
-                 fontsize=10, verticalalignment='center')
-        
-        plt.suptitle('GAR-V6 导弹制导方程 - 高级理论分析', 
-                    fontsize=16, fontweight='bold', y=1.02)
-        plt.tight_layout()
-        
-        # 保存图表
-        plt.savefig('gar_v6_advanced_analysis.png', dpi=300, bbox_inches='tight')
-        plt.show()
-        
-        return {
-            'comparisons': comparisons,
-            'validation': validation,
-            'mc_results': mc_results
-        }
+# ============================================================
+# Font setup (optional, avoid Chinese glyph warnings)
+# ============================================================
+def setup_cjk_font():
+    import matplotlib
+    from matplotlib import font_manager
+    preferred = [
+        "Noto Sans CJK SC", "Noto Sans CJK JP", "Microsoft YaHei",
+        "SimHei", "PingFang SC", "WenQuanYi Zen Hei", "Arial Unicode MS"
+    ]
+    available = {f.name for f in font_manager.fontManager.ttflist}
+    for name in preferred:
+        if name in available:
+            matplotlib.rcParams["font.family"] = name
+            matplotlib.rcParams["axes.unicode_minus"] = False
+            return True
+    matplotlib.rcParams["font.family"] = "DejaVu Sans"
+    matplotlib.rcParams["axes.unicode_minus"] = False
+    return False
 
-# ============================================================================
-# 演示代码
-# ============================================================================
+setup_cjk_font()
 
-def demonstrate_gar_v6():
-    """演示GAR-V6的高级功能"""
-    
-    print("="*80)
-    print("GAR-V6 导弹制导方程 - 高级研究平台")
-    print("="*80)
-    
-    # 创建模型
-    model = GARV6Advanced()
-    
-    print("\n1. 基础预测测试")
-    print("-"*40)
-    
-    test_points = [1000, 10000, 100000, 1000000]
-    for k in test_points:
-        pred = model.tau_star(k)
-        print(f"k={k:,}: τ* = {pred:,.2f}")
-    
-    print("\n2. 批量预测零点")
-    print("-"*40)
-    
-    predictions = model.predict_zeros(n_zeros=20, start_k=1000)
-    print(f"预测 {len(predictions['k'])} 个零点:")
-    print(f"平均间隔: {predictions['mean_interval']:.3f}")
-    print(f"间隔标准差: {predictions['std_interval']:.3f}")
-    
-    print("\n3. 理论性质验证")
-    print("-"*40)
-    
-    k_test = np.logspace(3, 5, 100)
-    validation = model.validate_theoretical_properties(k_test)
-    stats = validation['interval_stats']
-    
-    print(f"零点间隔统计:")
-    print(f"  均值: {stats['mean']:.6f}")
-    print(f"  标准差: {stats['std']:.6f}")
-    print(f"  变异系数: {stats['cv']:.6f}")
-    print(f"  理论预测均值: {2*np.pi/np.log(10000):.6f}")
-    
-    print("\n4. 蒙特卡洛分析")
-    print("-"*40)
-    
-    mc_results = model.monte_carlo_analysis()
-    print(f"蒙特卡洛统计 (1000个样本):")
-    print(f"  均值: {mc_results['mean']:,.2f}")
-    print(f"  标准差: {mc_results['std']:,.2f}")
-    print(f"  偏度: {mc_results['skewness']:.4f}")
-    print(f"  峰度: {mc_results['kurtosis']:.4f}")
-    
-    print("\n5. 物理意义解释")
-    print("-"*40)
-    
-    physics = model.generate_physical_interpretation()
-    for term, info in physics.items():
-        print(f"\n{info['description']}:")
-        print(f"  物理: {info['physics']}")
-        print(f"  关系: {info['relation']}")
-    
-    print("\n6. 生成高级分析图表...")
-    print("-"*40)
-    
-    analysis_results = model.plot_advanced_analysis()
-    
-    print("\n" + "="*80)
-    print("分析完成！")
-    print("="*80)
-    
-    # 生成最终报告
-    final_report = f"""
-    ===================================================================
-    GAR-V6 导弹制导方程 - 最终验证报告
-    ===================================================================
-    
-    公式验证状态: ✅ 完全通过
-    
-    核心参数:
-      • S = {model.params['S']} (全局能量映射标度)
-      • β = {model.params['beta']} (双曲引力场强度)
-      • A₂ = {model.params['A2']} (波动强度)
-      • ω = {model.params['omega']} (黄金频率)
-      • φ = {model.params['phi']:.3f} (自旋启动相位)
-    
-    理论验证:
-      • 零点间隔分布符合随机矩阵理论预测
-      • 渐近行为与黎曼-冯·曼戈尔特公式一致
-      • 误差随k增大而系统衰减
-    
-    性能指标 (关键点):
-      • k=10³: 预测精度 ~12.5%
-      • k=10⁴: 预测精度 ~3.3%
-      • k=10⁵: 预测精度 ~0.06%
-      • k=10⁶: 预测精度 ~1.3%
-    
-    物理意义确认:
-      • 成功描述算术宇宙的双曲扩张
-      • 体现最小作用量原理的驻波形成
-      • 验证黄金频率在相干性中的关键作用
-    
-    结论:
-      GAR-V6公式是一个既具有深刻理论意义又具备实用价值的
-      数学模型，完美融合了数论、物理和工程需求。
-    
-    ===================================================================
-    """
-    
-    print(final_report)
-    
-    return model, analysis_results
 
-# 运行演示
-if __name__ == "__main__":
-    model, results = demonstrate_gar_v6()
-    
-    # 保存模型参数
-    import json
-    model_config = {
-        'parameters': model.params,
-        'theoretical_constants': model.theoretical_params,
-        'performance_metrics': {
-            'key_points': {
-                1000: float(model.tau_star(1000)),
-                10000: float(model.tau_star(10000)),
-                100000: float(model.tau_star(100000)),
-                1000000: float(model.tau_star(1000000))
-            }
-        }
+# ============================================================
+# Core utilities
+# ============================================================
+def mean_spacing_from_T(T):
+    # Δ(T) ≈ 2π / log(T/2π)
+    T = np.asarray(T, dtype=np.float64)
+    denom = np.log(np.maximum(T / (2 * np.pi), 1.0000001))
+    denom = np.where(denom > 0.1, denom, 0.1)
+    return 2.0 * np.pi / denom
+
+
+def r_stat_from_unfolded(unfolded):
+    s = np.asarray(unfolded, dtype=np.float64)
+    s = s[np.isfinite(s)]
+    if len(s) < 3:
+        return np.array([])
+    r = np.minimum(s[1:], s[:-1]) / np.maximum(s[1:], s[:-1])
+    r = r[np.isfinite(r)]
+    return np.clip(r, 0.0, 1.0)
+
+
+def unfolded_positions_from_spacings(s, x0=0.0):
+    s = np.asarray(s, dtype=np.float64)
+    s = s[np.isfinite(s)]
+    x = np.empty(len(s) + 1, dtype=np.float64)
+    x[0] = float(x0)
+    x[1:] = x0 + np.cumsum(s)
+    return x
+
+
+# ============================================================
+# Rigidity: Σ^2(L) and Δ3(L)
+# ============================================================
+def number_variance_sigma2(x, L_values, n_windows=4000, seed=0):
+    rng = np.random.default_rng(seed)
+    x = np.asarray(x, dtype=np.float64)
+    x = x[np.isfinite(x)]
+    x.sort()
+    if len(x) < 300:
+        return np.full_like(L_values, np.nan, dtype=np.float64)
+
+    xmin, xmax = x[0], x[-1]
+    sig2 = []
+    for L in L_values:
+        if xmax - xmin <= L + 1:
+            sig2.append(np.nan)
+            continue
+        starts = rng.uniform(xmin, xmax - L, size=n_windows)
+        left = np.searchsorted(x, starts, side="left")
+        right = np.searchsorted(x, starts + L, side="right")
+        counts = (right - left).astype(np.float64)
+        sig2.append(float(np.var(counts, ddof=1)))
+    return np.array(sig2, dtype=np.float64)
+
+
+def delta3_rigidity(x, L_values, n_windows=1200, grid_points=200, seed=1):
+    rng = np.random.default_rng(seed)
+    x = np.asarray(x, dtype=np.float64)
+    x = x[np.isfinite(x)]
+    x.sort()
+    if len(x) < 500:
+        return np.full_like(L_values, np.nan, dtype=np.float64)
+
+    xmin, xmax = x[0], x[-1]
+    out = []
+    for L in L_values:
+        if xmax - xmin <= L + 1:
+            out.append(np.nan)
+            continue
+        starts = rng.uniform(xmin, xmax - L, size=n_windows)
+        vals = []
+        for s0 in starts:
+            t = np.linspace(s0, s0 + L, grid_points)
+            Nt = np.searchsorted(x, t, side="right").astype(np.float64)
+
+            A = np.vstack([t, np.ones_like(t)]).T
+            a, b = np.linalg.lstsq(A, Nt, rcond=None)[0]
+
+            resid2 = (Nt - (a * t + b))**2
+            integral = np.trapz(resid2, t)
+            vals.append(integral / L)
+        out.append(float(np.mean(vals)))
+    return np.array(out, dtype=np.float64)
+
+
+# ============================================================
+# Short-range RMT reference distributions: spacing s and ratio r
+# ============================================================
+def pdf_spacing_poisson(s):
+    s = np.asarray(s, dtype=np.float64)
+    return np.exp(-np.maximum(s, 0.0))
+
+def pdf_spacing_goe_wigner(s):
+    # GOE Wigner: p(s)=(pi/2)s exp(-pi s^2/4)
+    s = np.asarray(s, dtype=np.float64)
+    s = np.maximum(s, 0.0)
+    return (np.pi/2.0) * s * np.exp(-np.pi * s*s / 4.0)
+
+def pdf_spacing_gue_wigner(s):
+    # GUE Wigner: p(s)=(32/pi^2)s^2 exp(-4 s^2/pi)
+    s = np.asarray(s, dtype=np.float64)
+    s = np.maximum(s, 0.0)
+    return (32.0/(np.pi**2)) * (s**2) * np.exp(-4.0*(s**2)/np.pi)
+
+def pdf_r_poisson(r):
+    # Poisson r: p(r)=2/(1+r)^2 on [0,1]
+    r = np.asarray(r, dtype=np.float64)
+    r = np.clip(r, 0.0, 1.0)
+    return 2.0 / (1.0 + r)**2
+
+def pdf_r_atas_beta(r, beta):
+    # Atas family (unnormalized): (r+r^2)^β / (1+r+r^2)^(1+3β/2)
+    r = np.asarray(r, dtype=np.float64)
+    r = np.clip(r, 0.0, 1.0)
+    num = (r + r*r)**beta
+    den = (1.0 + r + r*r)**(1.0 + 1.5*beta)
+    return num / np.maximum(den, 1e-300)
+
+def build_normalized_pdf(pdf_raw_func, grid, *args):
+    raw = pdf_raw_func(grid, *args)
+    raw = np.maximum(raw, 0.0)
+    Z = np.trapz(raw, grid)
+    if Z <= 0:
+        return np.zeros_like(grid)
+    return raw / Z
+
+def empirical_cdf(samples, grid):
+    samples = np.asarray(samples, dtype=np.float64)
+    samples = samples[np.isfinite(samples)]
+    samples.sort()
+    return np.searchsorted(samples, grid, side="right") / max(len(samples), 1)
+
+def ks_distance_to_pdf(samples, grid, pdf):
+    pdf = np.asarray(pdf, dtype=np.float64)
+    pdf = np.maximum(pdf, 0.0)
+    Z = np.trapz(pdf, grid)
+    pdf = pdf / max(Z, 1e-12)
+    cdf = np.cumsum((pdf[:-1] + pdf[1:]) * 0.5 * np.diff(grid))
+    cdf = np.concatenate([[0.0], cdf])
+    cdf = np.clip(cdf, 0.0, 1.0)
+    F_emp = empirical_cdf(samples, grid)
+    return float(np.max(np.abs(F_emp - cdf))), cdf
+
+def w1_distance(samples, theory_samples):
+    samples = np.asarray(samples, dtype=np.float64)
+    samples = samples[np.isfinite(samples)]
+    theory_samples = np.asarray(theory_samples, dtype=np.float64)
+    theory_samples = theory_samples[np.isfinite(theory_samples)]
+    if len(samples) < 10 or len(theory_samples) < 10:
+        return float("nan")
+    return float(stats.wasserstein_distance(samples, theory_samples))
+
+def sample_from_grid_cdf(grid, cdf, size, rng):
+    u = rng.random(size)
+    return np.interp(u, cdf, grid)
+
+
+def short_range_rmt_classification(unfolded, rvals, seed=0, n_theory=120000):
+    rng = np.random.default_rng(seed)
+
+    # ---- spacing s ----
+    s = np.asarray(unfolded, dtype=np.float64)
+    s = s[np.isfinite(s)]
+    s = s[s >= 0]
+    smax = np.percentile(s, 99.5) * 1.6 + 1e-6
+    s_grid = np.linspace(0.0, max(smax, 6.0), 5000)
+
+    pdf_s = {
+        "Poisson": pdf_spacing_poisson(s_grid),
+        "GOE": pdf_spacing_goe_wigner(s_grid),
+        "GUE": pdf_spacing_gue_wigner(s_grid),
     }
-    
-    with open('gar_v6_model_config.json', 'w') as f:
-        json.dump(model_config, f, indent=2)
-    
-    print("模型配置已保存至: gar_v6_model_config.json")
-    print("分析图表已保存至: gar_v6_advanced_analysis.png")
+    s_metrics = {}
+    s_cdfs = {}
+    for k in ["Poisson", "GOE", "GUE"]:
+        ks, cdf = ks_distance_to_pdf(s, s_grid, pdf_s[k])
+        s_cdfs[k] = cdf
+        samp = sample_from_grid_cdf(s_grid, cdf, n_theory, rng)
+        w1 = w1_distance(s, samp)
+        s_metrics[k] = {"KS": ks, "W1": w1}
+    best_s = sorted([(k, s_metrics[k]["KS"], s_metrics[k]["W1"]) for k in s_metrics],
+                    key=lambda x: (x[1], x[2]))[0][0]
+    s_metrics["best_fit"] = best_s
+
+    # ---- r-stat ----
+    r = np.asarray(rvals, dtype=np.float64)
+    r = r[np.isfinite(r)]
+    r_grid = np.linspace(0.0, 1.0, 4000)
+
+    pdf_r = {
+        "Poisson": pdf_r_poisson(r_grid),
+        "GOE": build_normalized_pdf(pdf_r_atas_beta, r_grid, 1),
+        "GUE": build_normalized_pdf(pdf_r_atas_beta, r_grid, 2),
+    }
+    r_metrics = {}
+    r_cdfs = {}
+    for k in ["Poisson", "GOE", "GUE"]:
+        ks, cdf = ks_distance_to_pdf(r, r_grid, pdf_r[k])
+        r_cdfs[k] = cdf
+        samp = sample_from_grid_cdf(r_grid, cdf, n_theory, rng)
+        w1 = w1_distance(r, samp)
+        r_metrics[k] = {"KS": ks, "W1": w1}
+    best_r = sorted([(k, r_metrics[k]["KS"], r_metrics[k]["W1"]) for k in r_metrics],
+                    key=lambda x: (x[1], x[2]))[0][0]
+    r_metrics["best_fit"] = best_r
+
+    return {
+        "s_grid": s_grid, "pdf_s": pdf_s, "s_metrics": s_metrics,
+        "r_grid": r_grid, "pdf_r": pdf_r, "r_metrics": r_metrics
+    }
+
+
+# ============================================================
+# GAR-V6 macro smooth model + LOCKED baseline
+# ============================================================
+class GARV6Smooth:
+    def __init__(self):
+        self.params = {"S": 1.035, "beta": -1.500, "phi": np.pi/2}
+        self.ln2pi = np.log(2*np.pi)
+
+    def gamma_smooth(self, n):
+        n = np.asarray(n, dtype=np.float64)
+        n = np.maximum(n, 3.0)
+        S = self.params["S"]
+        beta = self.params["beta"]
+        phi = self.params["phi"]
+
+        denom = np.log(n) - self.ln2pi - 1.0
+        denom = np.where(denom > 0.1, denom, 0.1)
+        main = (2.0*np.pi*n) / denom
+        slow = beta * np.log(np.log(n))
+        return S * (main + slow + phi)
+
+
+class GARV6Locked(GARV6Smooth):
+    def __init__(self):
+        super().__init__()
+        self.A2 = 0.800
+        self.omega = 1.618
+
+    def gamma(self, n):
+        n = np.asarray(n, dtype=np.float64)
+        base = self.gamma_smooth(n)
+        return base + self.params["S"] * (self.A2 * np.sin(self.omega * n))
+
+
+# ============================================================
+# Folding: build gamma_n from unfolded positions x_n
+# ============================================================
+def fold_unfolded_positions_to_gamma(model_smooth: GARV6Smooth, start_n: int, x_unfolded: np.ndarray):
+    x = np.asarray(x_unfolded, dtype=np.float64)
+    x = x[np.isfinite(x)]
+    if len(x) < 10:
+        raise ValueError("unfolded positions too short")
+
+    M = len(x)
+    n = np.arange(start_n, start_n + M, dtype=np.int64)
+
+    gamma = np.empty(M, dtype=np.float64)
+    gamma[0] = float(model_smooth.gamma_smooth(np.array([start_n], dtype=np.float64))[0])
+
+    s = np.diff(x)
+    for i in range(M - 1):
+        Delta = mean_spacing_from_T(gamma[i])
+        gamma[i+1] = gamma[i] + Delta * s[i]
+    return n, gamma
+
+
+# ============================================================
+# Micro generators: IID_WIGNER / RM_GUE+GOE / CUE / PRIME_PHASE
+# ============================================================
+def sample_gue_wigner_spacings(size, rng):
+    # Rejection from Gamma(3,1/3)
+    from math import pi
+    def p(s):
+        return (32.0/(pi**2)) * s*s * np.exp(-4.0*s*s/pi)
+    def q(s):
+        return (27.0/2.0) * s*s * np.exp(-3.0*s)
+    Menv = 3.5
+    out = []
+    batch = max(8000, size * 4)
+    while len(out) < size:
+        s = rng.gamma(shape=3.0, scale=1.0/3.0, size=batch)
+        u = rng.random(batch)
+        acc = u < (p(s) / (Menv*q(s) + 1e-18))
+        out.extend(list(s[acc]))
+    return np.array(out[:size], dtype=np.float64)
+
+def gen_unfolded_iid_wigner(M, seed=0):
+    rng = np.random.default_rng(seed)
+    s = sample_gue_wigner_spacings(M - 1, rng)
+    s = s / np.mean(s)
+    return unfolded_positions_from_spacings(s, x0=0.0)
+
+
+def gen_unfolded_from_random_matrix(
+    M,
+    kind="GUE",
+    dim=600,
+    ensembles=None,
+    seed=0,
+    poly_deg=7,
+    take_bulk_frac=0.8,
+):
+    """
+    Robust RM generator:
+      - stitch multiple medium matrices until >= M bulk unfolded levels
+      - unfold each by polynomial fit rank(E)~P(z)
+      - concatenate with offsets and global normalize mean spacing=1
+    """
+    rng = np.random.default_rng(seed)
+    kind = kind.upper()
+
+    if ensembles is None:
+        bulk_per = max(80, int(dim * take_bulk_frac))
+        ensembles = int(np.ceil(M / bulk_per)) + 2
+
+    blocks = []
+    offset = 0.0
+
+    for _ in range(ensembles):
+        if kind == "GUE":
+            A = rng.normal(size=(dim, dim)) + 1j * rng.normal(size=(dim, dim))
+            H = (A + A.conj().T) / np.sqrt(2.0 * dim)
+            evals = np.linalg.eigvalsh(H).real
+        elif kind == "GOE":
+            A = rng.normal(size=(dim, dim))
+            H = (A + A.T) / np.sqrt(2.0 * dim)
+            evals = np.linalg.eigvalsh(H).real
+        else:
+            raise ValueError("kind must be 'GOE' or 'GUE'")
+
+        evals.sort()
+
+        m = int(dim * take_bulk_frac)
+        start = (dim - m) // 2
+        bulk = evals[start:start + m].astype(np.float64)
+
+        rank = np.arange(1, m + 1, dtype=np.float64)
+        mu, sig = np.mean(bulk), np.std(bulk)
+        z = (bulk - mu) / max(sig, 1e-12)
+
+        deg = int(min(poly_deg, m - 1))
+        coeff = np.polyfit(z, rank, deg)
+        P = np.poly1d(coeff)
+        x = P(z).astype(np.float64)
+        x.sort()
+
+        x = x - x.min()
+        sp = np.diff(x)
+        sp = sp[sp > 1e-12]
+        mean_sp = np.mean(sp) if len(sp) else 1.0
+        x = x / mean_sp
+
+        x = x + offset
+        offset = x[-1] + 1.5
+        blocks.append(x)
+
+        total = sum(len(b) for b in blocks)
+        if total >= M:
+            break
+
+    x_all = np.concatenate(blocks)
+    x_all.sort()
+
+    if len(x_all) < M:
+        raise RuntimeError(
+            f"{kind} RM produced only {len(x_all)} levels < M={M}. "
+            f"Increase ensembles or dim or take_bulk_frac."
+        )
+
+    x_all = x_all[:M]
+    sp = np.diff(x_all)
+    sp = sp[sp > 1e-12]
+    mean_sp = np.mean(sp) if len(sp) else 1.0
+    x_all = x_all / mean_sp
+    x_all = x_all - x_all[0]
+    return x_all
+
+
+def gen_unfolded_from_cue(M, dim=1200, seed=0):
+    """
+    Haar unitary (CUE): eigenangles give sine-kernel local statistics.
+    Natural unfolding: x = (N/2π)*theta, then normalize mean spacing.
+    """
+    rng = np.random.default_rng(seed)
+    Z = rng.normal(size=(dim, dim)) + 1j * rng.normal(size=(dim, dim))
+    Q, R = np.linalg.qr(Z)
+    diag = np.diag(R)
+    ph = diag / np.abs(diag)
+    Q = Q * ph.conj()
+
+    eigvals = np.linalg.eigvals(Q)
+    theta = np.mod(np.angle(eigvals), 2*np.pi)
+    theta.sort()
+
+    N = len(theta)
+    x = (N / (2*np.pi)) * theta
+    x = x - x.min()
+
+    sp = np.diff(x)
+    sp = sp[sp > 1e-12]
+    x = x / (np.mean(sp) if len(sp) else 1.0)
+
+    if len(x) < M:
+        raise RuntimeError(f"CUE produced only {len(x)} levels < M={M}. Increase dim.")
+    return x[:M]
+
+
+def primes_up_to(N):
+    sieve = np.ones(N + 1, dtype=bool)
+    sieve[:2] = False
+    for p in range(2, int(N**0.5) + 1):
+        if sieve[p]:
+            sieve[p*p:N+1:p] = False
+    return np.nonzero(sieve)[0]
+
+
+def gen_unfolded_prime_phase(M, seed=0, pmax=2000, strength=0.35, ar_rho=0.98):
+    """
+    Arithmetic-like correlated generator on unfolded spacings:
+      z_n = Σ a_p cos(2π n log p / scale + φ_p) + AR(1) noise
+      s_n = exp(z_n), normalize mean to 1
+    """
+    rng = np.random.default_rng(seed)
+    plist = primes_up_to(pmax)
+    logs = np.log(plist.astype(np.float64))
+    scale = np.max(logs) * 20.0
+
+    a = 1.0 / np.sqrt(plist.astype(np.float64))
+    a = a / np.linalg.norm(a)
+    a = a * strength
+    phi = rng.uniform(0, 2*np.pi, size=len(plist))
+
+    n = np.arange(M - 1, dtype=np.float64)
+    arg = (2*np.pi * np.outer(n, logs) / scale) + phi
+    field = np.cos(arg) @ a
+
+    eps = rng.normal(size=M - 1)
+    ar = np.empty(M - 1, dtype=np.float64)
+    ar[0] = eps[0]
+    sigma = np.sqrt(max(1 - ar_rho**2, 1e-12))
+    for i in range(1, M - 1):
+        ar[i] = ar_rho * ar[i-1] + sigma * eps[i]
+    ar = 0.25 * ar
+
+    z = field + ar
+    s = np.exp(z)
+    s = s / np.mean(s)
+    return unfolded_positions_from_spacings(s, x0=0.0)
+
+
+# ============================================================
+# Evaluation & plotting
+# ============================================================
+def evaluate_gamma(gamma):
+    gamma = np.asarray(gamma, dtype=np.float64)
+    intervals = np.diff(gamma)
+    theo = mean_spacing_from_T(gamma[1:])
+    unfolded = intervals / theo
+    r = r_stat_from_unfolded(unfolded)
+    x = unfolded_positions_from_spacings(unfolded, x0=0.0)
+    return {
+        "gamma": gamma,
+        "intervals": intervals,
+        "unfolded": unfolded,
+        "r": r,
+        "x_unfolded": x,
+        "mean_unfolded": float(np.mean(unfolded)),
+        "std_unfolded": float(np.std(unfolded)),
+        "mean_r": float(np.mean(r)) if len(r) else float("nan"),
+        "std_r": float(np.std(r)) if len(r) else float("nan"),
+    }
+
+
+def plot_short_range_overlay(result, sr, save_path="gar_v6_short_range.png"):
+    fig = plt.figure(figsize=(14, 6))
+
+    ax1 = plt.subplot(1, 2, 1)
+    ax1.hist(result["unfolded"], bins=90, density=True, alpha=0.6, label="model")
+    ax1.plot(sr["s_grid"], sr["pdf_s"]["Poisson"], "--", label="Poisson")
+    ax1.plot(sr["s_grid"], sr["pdf_s"]["GOE"], "--", label="GOE (Wigner)")
+    ax1.plot(sr["s_grid"], sr["pdf_s"]["GUE"], "--", label="GUE (Wigner)")
+    ax1.set_title(f"Unfolded spacing s | best_fit={sr['s_metrics']['best_fit']}")
+    ax1.set_xlabel("s")
+    ax1.set_ylabel("density")
+    ax1.grid(True, alpha=0.25)
+    ax1.legend()
+
+    ax2 = plt.subplot(1, 2, 2)
+    ax2.hist(result["r"], bins=90, density=True, alpha=0.6, label="model")
+    ax2.plot(sr["r_grid"], sr["pdf_r"]["Poisson"], "--", label="Poisson (Atas)")
+    ax2.plot(sr["r_grid"], sr["pdf_r"]["GOE"], "--", label="GOE (Atas)")
+    ax2.plot(sr["r_grid"], sr["pdf_r"]["GUE"], "--", label="GUE (Atas)")
+    ax2.set_title(f"r-stat distribution | best_fit={sr['r_metrics']['best_fit']}")
+    ax2.set_xlabel("r")
+    ax2.set_ylabel("density")
+    ax2.grid(True, alpha=0.25)
+    ax2.legend()
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches="tight")
+    plt.show()
+    return save_path
+
+
+def plot_rigidity(L_values, curves, save_path="gar_v6_rigidity.png"):
+    fig = plt.figure(figsize=(14, 6))
+
+    ax1 = plt.subplot(1, 2, 1)
+    for name, d in curves.items():
+        ax1.plot(L_values, d["sigma2"], label=name)
+    ax1.set_title(r"Number variance $\Sigma^2(L)$")
+    ax1.set_xlabel("L")
+    ax1.set_ylabel(r"$\Sigma^2(L)$")
+    ax1.grid(True, alpha=0.25)
+    ax1.legend()
+
+    ax2 = plt.subplot(1, 2, 2)
+    for name, d in curves.items():
+        ax2.plot(L_values, d["delta3"], label=name)
+    ax2.set_title(r"Spectral rigidity $\Delta_3(L)$")
+    ax2.set_xlabel("L")
+    ax2.set_ylabel(r"$\Delta_3(L)$")
+    ax2.grid(True, alpha=0.25)
+    ax2.legend()
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches="tight")
+    plt.show()
+    return save_path
+
+
+# ============================================================
+# Main
+# ============================================================
+def main():
+    # =========================================================
+    # Choose ONE mode:
+    #   "RM_GUE"     (1)  Random-matrix GUE point process (unfolded), then fold to gamma
+    #   "CUE_SINE"   (2)  CUE eigenangles (sine-kernel proxy), then fold
+    #   "PRIME_PHASE"(3)  prime-like correlated phase field (unfolded), then fold
+    #   "IID_WIGNER"      i.i.d Wigner-GUE spacings (short-range only), then fold
+    #   "LOCKED"          deterministic phase-locked on gamma axis
+    # =========================================================
+    MODE = "RM_GUE"
+
+    start_n = 1000
+    M = 15000
+
+    # Reference RM settings (if slow, reduce dim to 450; quality decreases a bit)
+    REF_DIM = 600
+    REF_BULK = 0.8
+    REF_POLY = 7
+
+    print("=" * 80)
+    print("GAR-V6 FINAL PLATFORM: short-range RMT + rigidity Σ^2(L), Δ3(L)")
+    print("=" * 80)
+    print(f"MODE={MODE} | start_n={start_n} | M={M}")
+
+    smooth = GARV6Smooth()
+
+    # ---- Generate gamma_n from chosen mode ----
+    if MODE == "LOCKED":
+        locked = GARV6Locked()
+        n = np.arange(start_n, start_n + M, dtype=np.int64)
+        gamma = locked.gamma(n)
+    else:
+        if MODE == "RM_GUE":
+            x = gen_unfolded_from_random_matrix(
+                M=M, kind="GUE", dim=REF_DIM, seed=7,
+                poly_deg=REF_POLY, take_bulk_frac=REF_BULK
+            )
+        elif MODE == "CUE_SINE":
+            x = gen_unfolded_from_cue(M=M, dim=1200, seed=9)
+        elif MODE == "PRIME_PHASE":
+            x = gen_unfolded_prime_phase(M=M, seed=11, pmax=2000, strength=0.35, ar_rho=0.98)
+        elif MODE == "IID_WIGNER":
+            x = gen_unfolded_iid_wigner(M=M, seed=42)
+        else:
+            raise ValueError("Unknown MODE")
+
+        n, gamma = fold_unfolded_positions_to_gamma(smooth, start_n, x)
+
+    # ---- Evaluate ----
+    res = evaluate_gamma(gamma)
+    print("\n[Model summary]")
+    print(f"unfolded mean: {res['mean_unfolded']:.6f} | std: {res['std_unfolded']:.6f}")
+    print(f"mean r      : {res['mean_r']:.6f} | std: {res['std_r']:.6f}")
+
+    # ---- Short-range classification ----
+    sr = short_range_rmt_classification(res["unfolded"], res["r"], seed=0, n_theory=120000)
+    print("\n[Short-range RMT classification]")
+    for k in ["Poisson", "GOE", "GUE"]:
+        ms = sr["s_metrics"][k]
+        mr = sr["r_metrics"][k]
+        print(f"{k:7s} | spacing: KS={ms['KS']:.6f}, W1={ms['W1']:.6f} | r: KS={mr['KS']:.6f}, W1={mr['W1']:.6f}")
+    print(f"-> best_fit(spacing)={sr['s_metrics']['best_fit']} | best_fit(r)={sr['r_metrics']['best_fit']}")
+
+    out_short = plot_short_range_overlay(res, sr, save_path=f"gar_v6_short_range_{MODE}.png")
+    print(f"\nSaved short-range plot -> {out_short}")
+
+    # ---- Rigidity analysis ----
+    L_values = np.array([1, 2, 3, 5, 7, 10, 14, 20, 28, 40, 55], dtype=np.float64)
+
+    # Poisson reference
+    rng = np.random.default_rng(123)
+    s_p = rng.exponential(scale=1.0, size=M - 1)
+    x_poisson = unfolded_positions_from_spacings(s_p, x0=0.0)
+
+    # RM references (true GUE and true GOE), unfolded directly in x
+    x_ref_gue = gen_unfolded_from_random_matrix(
+        M=M, kind="GUE", dim=REF_DIM, seed=101,
+        poly_deg=REF_POLY, take_bulk_frac=REF_BULK
+    )
+    x_ref_goe = gen_unfolded_from_random_matrix(
+        M=M, kind="GOE", dim=REF_DIM, seed=202,
+        poly_deg=REF_POLY, take_bulk_frac=REF_BULK
+    )
+
+    curves = {
+        f"{MODE} (model)": {
+            "sigma2": number_variance_sigma2(res["x_unfolded"], L_values, n_windows=4000, seed=0),
+            "delta3": delta3_rigidity(res["x_unfolded"], L_values, n_windows=1200, grid_points=200, seed=1),
+        },
+        "Poisson (ref)": {
+            "sigma2": number_variance_sigma2(x_poisson, L_values, n_windows=4000, seed=2),
+            "delta3": delta3_rigidity(x_poisson, L_values, n_windows=1200, grid_points=200, seed=3),
+        },
+        "RM-GUE (ref)": {
+            "sigma2": number_variance_sigma2(x_ref_gue, L_values, n_windows=4000, seed=4),
+            "delta3": delta3_rigidity(x_ref_gue, L_values, n_windows=1200, grid_points=200, seed=5),
+        },
+        "RM-GOE (ref)": {
+            "sigma2": number_variance_sigma2(x_ref_goe, L_values, n_windows=4000, seed=6),
+            "delta3": delta3_rigidity(x_ref_goe, L_values, n_windows=1200, grid_points=200, seed=7),
+        },
+    }
+
+    out_rig = plot_rigidity(L_values, curves, save_path=f"gar_v6_rigidity_{MODE}.png")
+    print(f"\nSaved rigidity plot -> {out_rig}")
+
+    # ---- Compact summary at L=10 and L=40 ----
+    def pick(arr, L):
+        idx = np.where(L_values == L)[0]
+        if len(idx) == 0:
+            return np.nan
+        return float(arr[idx[0]])
+
+    print("\n" + "-" * 80)
+    print("Rigidity summary (selected L)")
+    print("-" * 80)
+    for name, d in curves.items():
+        s10 = pick(d["sigma2"], 10); d10 = pick(d["delta3"], 10)
+        s40 = pick(d["sigma2"], 40); d40 = pick(d["delta3"], 40)
+        print(f"{name:14s} | L=10: Σ^2={s10:.4f}, Δ3={d10:.4f} | L=40: Σ^2={s40:.4f}, Δ3={d40:.4f}")
+
+    print("\nInterpretation guardrail:")
+    print("  - 若 best_fit(r)=GUE 但 Σ^2/Δ3 明显偏离 RM-GUE(ref)：只能说短程 GUE-like，不能说全尺度一致。")
+    print("  - 若 Σ^2/Δ3 也贴近 RM-GUE(ref)：才接近“点过程同类”（中程刚性一致）。")
+
+
+if __name__ == "__main__":
+    main()
+
