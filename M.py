@@ -818,70 +818,215 @@ def run_ablation_suite(base_cfg: Config, base_stop: StopCfg) -> None:
     print("=" * 108)
     print(df.to_string(index=False))
 
-# ----------------------------------------------------------------------------------------------------------
-# MAIN
-# ----------------------------------------------------------------------------------------------------------
-print("=" * 108)
-print("DeepSeek patch runner (FIXED): tethered Hessian for E_res and stability diagnostics")
-print("=" * 108)
 
-existing = sorted(glob.glob(CSV_GLOB))
-need_rerun = FORCE_RERUN
-if not need_rerun:
-    if len(existing) >= ENSEMBLE_SEEDS and validate_csvs(existing[:ENSEMBLE_SEEDS]):
-        need_rerun = False
-    else:
-        need_rerun = True
-
-if need_rerun:
-    print("\nCleaning old baseline CSV/manifest...")
-    for fp in glob.glob("v6_9_4g_fixed3c6_path_seed*.csv"):
-        try: os.remove(fp)
-        except: pass
-    try:
-        if os.path.exists(MANIFEST_PATH):
-            os.remove(MANIFEST_PATH)
-    except: pass
-
-manifest = run_v6_9_4g_fixed3c6_full(cfg0, stop_cfg0, ensemble_seeds=ENSEMBLE_SEEDS, tag="")
-
-m = read_manifest()
-H_star = np.array(m["H_star"], dtype=float)
-
-files = sorted(glob.glob("v6_9_4g_fixed3c6_path_seed[0-9].csv"))
-if len(files) == 0:
-    files = sorted(glob.glob("v6_9_4g_fixed3c6_path_seed*.csv"))
-
-resA = settlement_from_files(
-    files=files,
-    cfg=cfg0,
-    H_star=H_star,
-    mode="IMPLY_P_FROM_LAMBDA",
-    log10K_target=cfg0.log10K_target,
-    target_log10_lambda=LAMBDA_OBS_LOG10,
-    p_theory=None
-)
-print_settlement_report("BASELINE", files, H_star, cfg0, resA)
-
-cand = candidate_p_values(cfg0)
-print("\n[Candidate p transparency]")
-for k,v in cand.items():
-    print(f"  {k:9s} = {v:.10f}   Δ vs p* = {abs(v - resA['p_star']):.3e}")
-
-print("\n" + "="*108)
-print("[PREDICTION MODE DEMO] Predict Λ from fixed p_theory (true test; not an identity)")
-print("="*108)
-for name, pval in cand.items():
-    resB = settlement_from_files(
-        files=files,
-        cfg=cfg0,
-        H_star=H_star,
-        mode="PREDICT_LAMBDA_FROM_P",
-        log10K_target=cfg0.log10K_target,
-        target_log10_lambda=LAMBDA_OBS_LOG10,
-        p_theory=pval
-    )
-    print(f"p_theory={name:9s}={pval:.10f}  pred log10Λ={resB['log10Lambda_pred']:.6f}  Δdex={resB['delta_dex_vs_obs']:+.6f}")
 
 if RUN_ABLATIONS:
     run_ablation_suite(cfg0, stop_cfg0)
+
+    # ----------------------------------------------------------------------------------------------------------
+# MODE B MASS SCAN (power-law / linear structure diagnostics)
+# ----------------------------------------------------------------------------------------------------------
+RUN_MODEB_MASS_SCAN = True
+
+# 扫描范围：m = m0 * 10^{logm}, logm ∈ [M_MIN_EXP, M_MAX_EXP]
+M0 = 1.0
+M_MIN_EXP = -6
+M_MAX_EXP = 6
+M_N = 241
+
+# 局部斜率窗口（奇数）
+MASS_SCAN_WIN = 31
+
+# 选择 p：如果 None，就用 p_geom（你也可以换成 p_alpha1/p_alpha2 或直接写死某个 p）
+MODEB_P_CHOICE = "p_geom"  # "p_geom" / "p_alpha1" / "p_alpha2"
+
+
+def modeB_log10_ledger(I_path, E_res, p_theory, log10K_val):
+    """[Mode B] 账本：log10 alphaG_hat = log10(I) + log10(E) - p*log10(K(m))"""
+    term_I = safe_log10(I_path)
+    term_E = safe_log10(E_res)
+    return float(term_I + term_E - float(p_theory) * float(log10K_val))
+
+
+def _linfit_beta(x, y):
+    """y ~ beta*x + intercept; returns beta, intercept, R2"""
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    A = np.vstack([x, np.ones_like(x)]).T
+    beta, intercept = np.linalg.lstsq(A, y, rcond=None)[0]
+    yhat = beta * x + intercept
+    ss_res = float(np.sum((y - yhat)**2))
+    ss_tot = float(np.sum((y - float(np.mean(y)))**2))
+    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 1.0
+    return float(beta), float(intercept), float(r2)
+
+
+def _sliding_beta(x, y, win=31):
+    """滑动窗口局部 beta：返回 centers, betas, r2s"""
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    if win % 2 == 0:
+        win += 1
+    half = win // 2
+    centers, betas, r2s = [], [], []
+    for i in range(half, len(x) - half):
+        xs = x[i-half:i+half+1]
+        ys = y[i-half:i+half+1]
+        b, a, r2 = _linfit_beta(xs, ys)
+        centers.append(x[i])
+        betas.append(b)
+        r2s.append(r2)
+    return np.array(centers), np.array(betas), np.array(r2s)
+
+
+def log10K_mass_inject_A(logm, cfg: Config):
+    """
+    inject A: 纯幂律注入（最“理想”的幂律，拟合会趋向 R2=1）
+      log10K(m) = log10K_star + log10(m/m0) = log10K_target + logm
+    """
+    return float(cfg.log10K_target + logm)
+
+
+def log10K_mass_inject_B(logm, cfg: Config, lam: float, mu_sigma: float = 0.01, mu_t: float = 0.0):
+    """
+    inject B: 让 K(m) 通过“锚点附近的几何响应”产生非平凡结构。
+    这里示例用：sigma_eff = sigma* + mu_sigma*logm, t_eff = t* + mu_t*logm
+    然后用你当前的 K-lock 模型：log10K_pred(sigma_eff, t_eff, lam)
+
+    你可以把这里替换成你更物理/更想要的注入方式。
+    """
+    sigma_eff = cfg.sigma_star + mu_sigma * logm
+    t_eff = cfg.t_star + mu_t * logm
+    # 防止走出盒子导致数值炸：轻微 clamp（可选）
+    sigma_eff = clamp(sigma_eff, cfg.sigma_star - 0.5, cfg.sigma_star + 0.5)
+    t_eff = clamp(t_eff, cfg.t_star - 2.0, cfg.t_star + 2.0)
+    return float(log10K_pred(sigma_eff, t_eff, lam))
+
+
+def run_modeB_mass_scan_from_settlement(
+    *,
+    title: str,
+    I_mean: float,
+    E_mean: float,
+    cfg: Config,
+    p_theory: float,
+    lam: float,
+    inject: str = "A",
+    mu_sigma: float = 0.01,
+    mu_t: float = 0.0,
+):
+    logm = np.linspace(M_MIN_EXP, M_MAX_EXP, M_N)
+    m = M0 * (10.0 ** logm)
+
+    # build log10K(m)
+    if inject.upper() == "A":
+        log10K_m = np.array([log10K_mass_inject_A(lm, cfg) for lm in logm], dtype=float)
+    elif inject.upper() == "B":
+        log10K_m = np.array([log10K_mass_inject_B(lm, cfg, lam, mu_sigma=mu_sigma, mu_t=mu_t) for lm in logm], dtype=float)
+    else:
+        raise ValueError("inject must be 'A' or 'B'")
+
+    # Mode B output: log10 alphaG_hat(m)
+    y = np.array([modeB_log10_ledger(I_mean, E_mean, p_theory, lk) for lk in log10K_m], dtype=float)
+
+    beta, intercept, r2 = _linfit_beta(logm, y)
+    c, b_loc, r2_loc = _sliding_beta(logm, y, win=MASS_SCAN_WIN)
+
+    print("\n" + "=" * 108)
+    print(f"[MODE B MASS SCAN] {title}  inject={inject.upper()}")
+    if inject.upper() == "B":
+        print(f"  (mu_sigma={mu_sigma:.6g}, mu_t={mu_t:.6g})")
+    print("=" * 108)
+    print(f"  I_mean={I_mean:.12g}  E_mean={E_mean:.12g}  p_theory={p_theory:.12f}")
+    print(f"[Mode B mass scan] beta_fit={beta:.6f}  intercept={intercept:.6f}  R2={r2:.12f}")
+    print("  If your framework reproduces GR scaling, you expect a stable power law in log-log.")
+
+    # 局部稳定性统计
+    print("\n[Local slope stability]")
+    print(f"  window={MASS_SCAN_WIN}  beta_local_mean={float(np.mean(b_loc)):.6f}  beta_local_std={float(np.std(b_loc)):.6e}")
+    print(f"  beta_local_span={float(np.max(b_loc)-np.min(b_loc)):.6e}")
+    print(f"  local_R2: min={float(np.min(r2_loc)):.6f}  median={float(np.median(r2_loc)):.6f}")
+
+    return {
+        "logm": logm,
+        "m": m,
+        "log10K_m": log10K_m,
+        "log10_alphaG_m": y,
+        "beta": beta,
+        "intercept": intercept,
+        "r2": r2,
+        "beta_local": b_loc,
+        "beta_local_centers": c,
+        "beta_local_r2": r2_loc,
+    }
+
+
+def run_modeB_mass_scans_using_latest_manifest():
+    """
+    一键跑：读 manifest 拿到 tethered Hessian，然后用 BASELINE 的 CSV 结算出 I_mean/E_mean，
+    再对 inject A/B 做 mass scan。
+    """
+    # 1) 找到 baseline CSV（无 tag）
+    files = sorted(glob.glob("v6_9_4g_fixed3c6_path_seed[0-9].csv"))
+    if len(files) == 0:
+        # fallback：你如果刚跑完 ablations，可能只有带 tag 的文件
+        print("[MODE B MASS SCAN] No baseline CSV found (seed*.csv). Skipping.")
+        return
+
+    # 2) 读 manifest 获取 H_star
+    if not os.path.exists(MANIFEST_PATH):
+        print("[MODE B MASS SCAN] manifest not found. Skipping.")
+        return
+    mfest = read_manifest()
+    H_star = np.array(mfest["H_star"], dtype=float)
+
+    # 3) settlement -> I_mean/E_mean
+    resA = settlement_from_files(
+        files=files,
+        cfg=cfg0,
+        H_star=H_star,
+        mode="IMPLY_P_FROM_LAMBDA",
+        log10K_target=cfg0.log10K_target,
+        target_log10_lambda=LAMBDA_OBS_LOG10,
+        p_theory=None
+    )
+
+    # 4) pick p_theory
+    cand = candidate_p_values(cfg0)
+    if MODEB_P_CHOICE not in cand:
+        raise ValueError(f"MODEB_P_CHOICE must be one of {list(cand.keys())}")
+    p_theory = float(cand[MODEB_P_CHOICE])
+
+    # 5) lam for K model
+    lam = lambda_cal_E1_pos_at_star(cfg0)
+
+    # 6) run inject A/B
+    run_modeB_mass_scan_from_settlement(
+        title=f"BASELINE settlement -> p={MODEB_P_CHOICE}",
+        I_mean=resA["I_mean"],
+        E_mean=resA["E_mean"],
+        cfg=cfg0,
+        p_theory=p_theory,
+        lam=lam,
+        inject="A",
+    )
+
+    run_modeB_mass_scan_from_settlement(
+        title=f"BASELINE settlement -> p={MODEB_P_CHOICE}",
+        I_mean=resA["I_mean"],
+        E_mean=resA["E_mean"],
+        cfg=cfg0,
+        p_theory=p_theory,
+        lam=lam,
+        inject="B",
+        mu_sigma=0.01,   # 你可以在这里调参，让 beta_fit 更贴你想要的“GR-like scaling”
+        mu_t=0.00
+    )
+
+
+# ----------------------------------------------------------------------------------------------------------
+# AUTO-RUN (after ablations or standalone)
+# ----------------------------------------------------------------------------------------------------------
+if RUN_MODEB_MASS_SCAN:
+    run_modeB_mass_scans_using_latest_manifest()
+
